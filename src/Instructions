@@ -1,0 +1,7 @@
+Welcome to Lloyd Industries!
+
+To begin, please make sure you have arduino IDE (integrated development environment) installed. 
+
+Connect the ESP32 board using a USB-C cable to your PC. 
+
+Head to tools, board manager, and install ESP32 Core. 
