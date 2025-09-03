@@ -1,0 +1,498 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
+#include <DNSServer.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include "driver/ledc.h"
+#include "logo.h"   // generated array: logo_png / logo_png_len
+
+/************ User-configurable (hardcoded) ************/
+static const char* YT_API_KEY    = "AIzaSyC2zgRFWF3JWz18KuU8L3Nc9Fe16jbi5T4";
+static const char* YT_CHANNEL_ID = "UCs9xjPSAJUzK07QwkJ7ucvA";
+/*******************************************************/
+
+Preferences prefs;
+WebServer server(80);
+DNSServer dnsServer;
+
+#define PIN_LEFT  6
+#define PIN_RIGHT 7
+#define PIN_BODY  5
+
+// LEDC (ESP32-C3)
+#define LEDC_MODE  LEDC_LOW_SPEED_MODE
+#define LEDC_TIMER LEDC_TIMER_0
+#define LEDC_RES   LEDC_TIMER_8_BIT   // 0–255 duty
+#define LEDC_FREQ  1000               // 1 kHz
+#define CH_LEFT    LEDC_CHANNEL_0
+#define CH_RIGHT   LEDC_CHANNEL_1
+#define CH_BODY    LEDC_CHANNEL_2
+
+// State
+int leftDuty = 0, rightDuty = 0, bodyDuty = 0;
+int globalBrightness = 255;                 // scales 0..255
+int behaviorMode = 0;                       // 0=manual, 1=flap, 2=flash
+bool wifiConnected = false;
+
+// Notifier
+bool notifierEnabled = false;               // toggle
+int notifierEffect = 2;                     // 0=AllOn,1=AllOff,2=Flash,3=Flap
+String lastVideoId = "";
+String lastThumbUrl = "";
+String lastVideoTitle = "";
+unsigned long lastYTCheck = 0;
+const unsigned long YT_CHECK_INTERVAL_MS = 3600000UL; // 1 hour
+
+// DNS
+const byte DNS_PORT = 53;
+
+// ---------- HTML / CSS (shared) ----------
+const char STYLE[] PROGMEM = R"rawliteral(
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    :root { --bg:#0a1a2f; --card:#13294b; --text:#f0f0f0; --accent:#ffcc00; --accentH:#e6b800; }
+    * { box-sizing: border-box; }
+    body {
+      font-family: Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0; padding: 20px;
+      display:flex; min-height:100vh; align-items:center; justify-content:center;
+    }
+    .card {
+      width: 100%; max-width: 540px;
+      background: var(--card);
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: 0 0 20px rgba(0,0,0,0.6);
+      text-align:center;
+    }
+    img.logo {
+      width: 240px; max-width: 90%;
+      margin: 10px auto 16px; display:block;
+    }
+    h2 { margin: 6px 0 14px; }
+    button, input[type=submit], select {
+      background: var(--accent); color:#000; border: none;
+      border-radius: 10px; padding: 14px;
+      font-size: 16px; cursor: pointer; margin: 8px 0; width: 100%;
+      transition: background 0.2s ease;
+    }
+    button:hover, input[type=submit]:hover { background: var(--accentH); }
+    input[type=text], input[type=password], input[type=range] {
+      width: 100%; padding: 12px; margin: 10px 0 14px;
+      border-radius: 8px; border: none; font-size: 15px;
+      background:#0f213b; color:#fff;
+    }
+    label { display:block; text-align:left; margin: 6px 0 4px; font-size:14px; opacity:0.9; }
+    hr { margin: 18px 0; border: 0; border-top: 1px solid #24406f; }
+    .row { display:flex; gap:10px; }
+    .thumb { width:100%; border-radius:10px; }
+    .note { opacity:0.8; font-size: 13px; }
+    .toggle { display:flex; align-items:center; gap:8px; justify-content:space-between; }
+    .toggle input { width:auto; }
+    @media (max-width: 420px) { img.logo { width: 180px; } }
+  </style>
+)rawliteral";
+
+// ---------- Utility to send a styled card ----------
+void sendCardPage(const String& title, const String& bodyHtml, const String& buttonLabel = String(), const String& buttonHref = String()) {
+  String page = F("<!DOCTYPE html><html><head><title>");
+  page += title;
+  page += F("</title>");
+  page += STYLE;
+  page += F("</head><body><div class='card'>"
+            "<img class='logo' src='/logo.png'>"
+            "<h2>");
+  page += title;
+  page += F("</h2>");
+  page += bodyHtml;
+  if (buttonLabel.length()) {
+    page += F("<button onclick=\"location.href='");
+    page += buttonHref.length() ? buttonHref : F("/");
+    page += F("'\">");
+    page += buttonLabel;
+    page += F("</button>");
+  }
+  page += F("</div></body></html>");
+  server.send(200, "text/html", page);
+}
+
+// ---------- LED / PWM ----------
+static inline void applyDuty(ledc_channel_t ch, int val) {
+  int scaled = (val * globalBrightness) / 255;
+  ledc_set_duty(LEDC_MODE, ch, scaled);
+  ledc_update_duty(LEDC_MODE, ch);
+}
+
+void updateOutputs() {
+  applyDuty(CH_LEFT,  leftDuty);
+  applyDuty(CH_RIGHT, rightDuty);
+  applyDuty(CH_BODY,  bodyDuty);
+}
+
+void ledsOff()       { leftDuty = rightDuty = bodyDuty = 0;   behaviorMode=0; updateOutputs(); }
+void ledsAllOn()     { leftDuty = rightDuty = bodyDuty = 255; behaviorMode=0; updateOutputs(); }
+
+// “Flash” = smooth fade of all channels together
+void ledsFlashStep() {
+  static int d = 0;
+  static int dir = 1; // 1 up, -1 down
+  d += dir * 10;
+  if (d >= 255) { d = 255; dir = -1; }
+  if (d <= 0)   { d = 0;   dir = 1;  }
+  leftDuty = rightDuty = bodyDuty = d;
+  updateOutputs();
+}
+
+// “Flap” = wings smooth fade together, body solid ON
+void ledsFlapStep() {
+  static int d = 0;
+  static int dir = 1;
+  d += dir * 10;
+  if (d >= 255) { d = 255; dir = -1; }
+  if (d <= 0)   { d = 0;   dir = 1;  }
+  leftDuty = rightDuty = d;
+  bodyDuty = 255;
+  updateOutputs();
+}
+
+// ---------- HTML pages ----------
+const char controlPage[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head><title>Logo Light Kit</title>%STYLE%</head>
+<body>
+  <div class="card">
+    <img class="logo" src="/logo.png">
+    <h2>Logo Light Kit</h2>
+    %THUMB%
+    <button onclick="fetch('/led/allon')">All ON</button>
+    <button onclick="fetch('/led/alloff')">All OFF</button>
+    <div class="row">
+      <button style="flex:1" onclick="fetch('/led/flash')">Flash (Fade)</button>
+      <button style="flex:1" onclick="fetch('/led/flap')">Flap (Wings Fade)</button>
+    </div>
+    <p style="margin-top:6px;">Mode: %MODE%</p>
+    <hr>
+    <label>Global Brightness</label>
+    <input type="range" min="0" max="255" value="%BRIGHT%" oninput="fetch('/brightness?val='+this.value)">
+    <hr>
+    <button onclick="location.href='/settings'">Settings</button>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+const char settingsPage[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head><title>Settings</title>%STYLE%</head>
+<body>
+  <div class="card">
+    <img class="logo" src="/logo.png">
+    <h2>Settings</h2>
+    <div class="toggle">
+      <label>New Video Notificator</label>
+      <input id="notifToggle" type="checkbox" %NOTIF% onchange="fetch('/setNotifier?en='+(this.checked?1:0))">
+    </div>
+    <label>When new video is detected:</label>
+    <select onchange="fetch('/setNotifierEffect?mode='+this.value)">
+      <option value="0" %SEL0%>All On</option>
+      <option value="1" %SEL1%>All Off</option>
+      <option value="2" %SEL2%>Flash (Fade)</option>
+      <option value="3" %SEL3%>Flap (Wings Fade)</option>
+    </select>
+    <p class="note">Tip: Leave the lights in a different mode so it’s obvious when a new video triggers.</p>
+    <hr>
+    <button onclick="if(confirm('Forget WiFi and reboot?')) fetch('/forget')">Forget WiFi</button>
+    <button onclick="location.href='/'">Back</button>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+// ---------- Helpers ----------
+String modeString() {
+  if (behaviorMode==0) return "Manual";
+  if (behaviorMode==1) return "Flap";
+  return "Flash";
+}
+
+String latestThumbHtml() {
+  if (lastVideoId.length()==0 || lastThumbUrl.length()==0) return "";
+  String url = "https://www.youtube.com/watch?v=" + lastVideoId;
+  String html = "<h3>Latest YouTube Video!</h3>";
+  if (lastVideoTitle.length()) {
+    html += "<p><b>" + lastVideoTitle + "</b></p>";
+  }
+  html += "<a href='" + url + "' target='_blank'>";
+  html += "<img class='thumb' src='" + lastThumbUrl + "'>";
+  html += "</a>";
+  html += "<p>Click to watch!</p><hr>";
+  return html;
+}
+
+
+// ---------- YouTube check ----------
+bool checkYouTubeLatest(String& newVid, String& thumbUrl) {
+  if (!wifiConnected) return false;
+  String url = "https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=";
+  url += YT_CHANNEL_ID;
+  url += "&order=date&maxResults=1&type=video&key=";
+  url += YT_API_KEY;
+
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient https;
+  if (!https.begin(client, url)) return false;
+  int code = https.GET();
+  Serial.println("YT HTTP code: " + String(code));
+  if (code != 200) { https.end(); return false; }
+
+  String payload = https.getString();
+  https.end();
+  Serial.println("Payload: " + payload); // debug
+
+  int idPos = payload.indexOf("videoId");
+if (idPos < 0) return false;
+int q1 = payload.indexOf('"', idPos + 9);
+int q2 = payload.indexOf('"', q1 + 1);
+if (q1 < 0 || q2 < 0) return false;
+newVid = payload.substring(q1+1, q2);
+thumbUrl = "https://img.youtube.com/vi/" + newVid + "/hqdefault.jpg";
+
+// parse title
+int tPos = payload.indexOf("\"title\":");
+if (tPos > 0) {
+  int q1 = payload.indexOf('"', tPos + 8);
+  int q2 = payload.indexOf('"', q1 + 1);
+  if (q1 > 0 && q2 > 0) {
+    lastVideoTitle = payload.substring(q1 + 1, q2);
+  }
+}
+
+
+  return true;
+}
+
+void applyNotifierEffect() {
+  switch (notifierEffect) {
+    case 0: ledsAllOn(); break;
+    case 1: ledsOff();   break;
+    case 2: behaviorMode = 2; break;
+    case 3: behaviorMode = 1; break;
+  }
+}
+
+// ---------- Captive Portal ----------
+void handleSetupRoot() {
+  int n = WiFi.scanNetworks();
+  String page = "<!DOCTYPE html><html><head><title>WiFi Setup</title>";
+  page += STYLE;
+  page += "</head><body><div class='card'>";
+  page += "<img class='logo' src='/logo.png'>";
+  page += "<h2>Logo Light Kit Setup</h2>";
+  page += "<form action='/save' method='POST'>";
+  page += "<label>WiFi Network</label><select name='ssid'>";
+  for (int i=0;i<n;i++) page += "<option value='" + WiFi.SSID(i) + "'>" + WiFi.SSID(i) + "</option>";
+  page += "</select>";
+  page += "<label>Password</label><input type='password' name='pass'>";
+  page += "<input type='submit' value='Connect'>";
+  page += "</form></div></body></html>";
+  server.send(200,"text/html",page);
+}
+
+void handleSetupSave() {
+  if (server.hasArg("ssid") && server.hasArg("pass")) {
+    prefs.begin("wifi",false);
+    prefs.putString("ssid", server.arg("ssid"));
+    prefs.putString("pass", server.arg("pass"));
+    prefs.end();
+    sendCardPage("Saved! Rebooting…", "<p>Connecting to WiFi now.</p>");
+    delay(1500);
+    ESP.restart();
+  } else {
+    sendCardPage("Error", "<p>Missing SSID or password.</p>", "Back", "/");
+  }
+}
+
+void startCaptivePortal() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("LogoLightKitSetup");
+  IPAddress IP = WiFi.softAPIP();
+  Serial.println("Captive portal at http://" + IP.toString());
+  dnsServer.start(DNS_PORT, "*", IP);
+  server.on("/", handleSetupRoot);
+  server.on("/save", HTTP_POST, handleSetupSave);
+  server.onNotFound(handleSetupRoot);
+  server.on("/logo.png", HTTP_GET, []() {
+    server.send_P(200, "image/png", (const char*)logo_png, logo_png_len);
+  });
+  server.begin();
+}
+
+// ---------- Control Server ----------
+void startControlServer() {
+  server.on("/", HTTP_GET, []() {
+    String page = controlPage;
+    page.replace("%STYLE%", STYLE);
+    page.replace("%MODE%", modeString());
+    page.replace("%BRIGHT%", String(globalBrightness));
+    page.replace("%THUMB%", latestThumbHtml());
+    server.send(200, "text/html", page);
+  });
+
+  server.on("/settings", HTTP_GET, []() {
+    String page = settingsPage;
+    page.replace("%STYLE%", STYLE);
+    page.replace("%NOTIF%", notifierEnabled ? "checked" : "");
+    page.replace("%SEL0%", notifierEffect==0 ? "selected" : "");
+    page.replace("%SEL1%", notifierEffect==1 ? "selected" : "");
+    page.replace("%SEL2%", notifierEffect==2 ? "selected" : "");
+    page.replace("%SEL3%", notifierEffect==3 ? "selected" : "");
+    server.send(200, "text/html", page);
+  });
+
+  // Light control
+  server.on("/led/allon",  HTTP_GET, [](){ ledsAllOn();  server.send(200,"text/plain","All ON");  });
+  server.on("/led/alloff", HTTP_GET, [](){ ledsOff();    server.send(200,"text/plain","All OFF"); });
+  server.on("/led/flash",  HTTP_GET, [](){ behaviorMode=2; server.send(200,"text/plain","Flash (fade)"); });
+  server.on("/led/flap",   HTTP_GET, [](){ behaviorMode=1; server.send(200,"text/plain","Flap (wings fade)"); });
+
+  // Live brightness
+  server.on("/brightness", HTTP_GET, [](){
+    if (server.hasArg("val")) {
+      globalBrightness = constrain(server.arg("val").toInt(), 0, 255);
+      updateOutputs();
+    }
+    server.send(200,"text/plain",String(globalBrightness));
+  });
+
+  // Notifier
+  server.on("/setNotifier", HTTP_GET, [](){
+    if (server.hasArg("en")) notifierEnabled = server.arg("en").toInt() == 1;
+    prefs.begin("settings", false);
+    prefs.putBool("notif", notifierEnabled);
+    prefs.end();
+    server.send(200,"text/plain", notifierEnabled ? "enabled" : "disabled");
+  });
+  server.on("/setNotifierEffect", HTTP_GET, [](){
+    if (server.hasArg("mode")) notifierEffect = constrain(server.arg("mode").toInt(), 0, 3);
+    prefs.begin("settings", false);
+    prefs.putInt("neffect", notifierEffect);
+    prefs.end();
+    server.send(200,"text/plain", String(notifierEffect));
+  });
+  server.on("/checkNow", HTTP_GET, [](){
+    String vid, thumb;
+    if (checkYouTubeLatest(vid, thumb)) {
+      if (vid.length() && vid != lastVideoId) {
+        lastVideoId = vid;
+        lastThumbUrl = thumb;
+        prefs.begin("settings",false);
+        prefs.putString("lastVid", lastVideoId);
+        prefs.putString("thumb", lastThumbUrl);
+        prefs.end();
+        applyNotifierEffect();
+      }
+    }
+    server.send(200,"text/plain","Check complete");
+  });
+
+  // Forget WiFi
+  server.on("/forget", HTTP_GET, [](){
+    prefs.begin("wifi", false); prefs.clear(); prefs.end();
+    sendCardPage("WiFi Cleared", "<p>Rebooting to setup mode…</p>");
+    delay(1500); ESP.restart();
+  });
+
+  // Local logo
+  server.on("/logo.png", HTTP_GET, []() {
+    server.send_P(200, "image/png", (const char*)logo_png, logo_png_len);
+  });
+
+  server.begin();
+  Serial.println("Control server at http://logolight.local");
+}
+
+// ---------- WiFi ----------
+void connectWiFi() {
+  prefs.begin("wifi",true);
+  String ssid=prefs.getString("ssid","");
+  String pass=prefs.getString("pass","");
+  prefs.end();
+
+  if (ssid==""){ startCaptivePortal(); return; }
+
+  WiFi.begin(ssid.c_str(),pass.c_str());
+  Serial.print("Connecting");
+  unsigned long start=millis();
+  while(WiFi.status()!=WL_CONNECTED && millis()-start<10000){ delay(500); Serial.print("."); }
+
+  if(WiFi.status()==WL_CONNECTED){
+    wifiConnected=true;
+    Serial.println("\nConnected! "+WiFi.localIP().toString());
+    if(MDNS.begin("logolight")) Serial.println("mDNS responder started: http://logolight.local");
+    startControlServer();
+  } else {
+    startCaptivePortal();
+  }
+}
+
+// ---------- Setup / Loop ----------
+void setup() {
+  Serial.begin(115200); delay(500);
+  Serial.println("Booting...");
+
+  // LEDC setup
+  ledc_timer_config_t t={LEDC_MODE,LEDC_RES,LEDC_TIMER,LEDC_FREQ,LEDC_AUTO_CLK};
+  ledc_timer_config(&t);
+  ledc_channel_config_t c1={PIN_LEFT,LEDC_MODE,CH_LEFT,LEDC_INTR_DISABLE,LEDC_TIMER,0,0};  ledc_channel_config(&c1);
+  ledc_channel_config_t c2={PIN_RIGHT,LEDC_MODE,CH_RIGHT,LEDC_INTR_DISABLE,LEDC_TIMER,0,0}; ledc_channel_config(&c2);
+  ledc_channel_config_t c3={PIN_BODY,LEDC_MODE,CH_BODY,LEDC_INTR_DISABLE,LEDC_TIMER,0,0};  ledc_channel_config(&c3);
+  ledsOff();
+
+  // Load settings
+  prefs.begin("settings",true);
+  globalBrightness = prefs.getInt("bright",255);
+  notifierEnabled  = prefs.getBool("notif", false);
+  notifierEffect   = prefs.getInt("neffect", 2);
+  lastVideoId      = prefs.getString("lastVid", "");
+  lastThumbUrl     = prefs.getString("thumb", "");
+  prefs.end();
+
+  connectWiFi();
+}
+
+void loop() {
+  if(!wifiConnected) dnsServer.processNextRequest();
+  server.handleClient();
+
+  static unsigned long lastAnim=0;
+  if (millis()-lastAnim > 40) {
+    if (behaviorMode==2) ledsFlashStep();
+    if (behaviorMode==1) ledsFlapStep();
+    lastAnim = millis();
+  }
+
+  if (wifiConnected && notifierEnabled) {
+    if (millis() - lastYTCheck > YT_CHECK_INTERVAL_MS) {
+      lastYTCheck = millis();
+      String vid, thumb;
+      if (checkYouTubeLatest(vid, thumb)) {
+        if (vid.length() && vid != lastVideoId) {
+          lastVideoId = vid;
+          lastThumbUrl = thumb;
+          prefs.begin("settings",false);
+          prefs.putString("lastVid", lastVideoId);
+          prefs.putString("thumb", lastThumbUrl);
+          prefs.end();
+          applyNotifierEffect();
+          Serial.println("New video detected: " + lastVideoId);
+        }
+      }
+    }
+  }
+}
